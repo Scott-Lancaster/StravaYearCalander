@@ -2,7 +2,7 @@
 import requests
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone   # ← Fixed: added timezone
 import os
 
 # ========================= CONFIGURATION =========================
@@ -71,6 +71,8 @@ def get_all_activities(access_token):
     page = 1
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
+    
+    # Fixed: timezone is now properly imported
     after_ts = int(datetime(YEAR, 1, 1, tzinfo=timezone.utc).timestamp())
     before_ts = int(datetime(YEAR + 1, 1, 1, tzinfo=timezone.utc).timestamp())
 
@@ -95,6 +97,29 @@ def get_all_activities(access_token):
     
     print(f"✅ Loaded {len(activities)} activities")
     return activities
+
+def calculate_current_streak(daily_data):
+    """Calculate current consecutive workout days"""
+    if not daily_data:
+        return 0
+    
+    workout_dates = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in daily_data.keys()])
+    
+    if not workout_dates:
+        return 0
+    
+    today = datetime.now().date()
+    streak = 0
+    current_date = today
+    
+    while True:
+        if current_date in workout_dates:
+            streak += 1
+            current_date -= timedelta(days=1)
+        else:
+            break
+    
+    return streak
 
 # ======================== MAIN ========================
 if __name__ == "__main__":
@@ -139,10 +164,18 @@ if __name__ == "__main__":
 
     print(f"📊 Found {len(daily_data)} workout days")
 
-    daily_json = json.dumps(daily_data, ensure_ascii=False)
+    # Calculate current streak
+    current_streak = calculate_current_streak(daily_data)
+    streak_text = f" | 🔥 {current_streak} day streak" if current_streak > 1 else ""
 
-    # Calculate average minutes per workout day
-    avg_minutes = round(total_minutes / len(daily_data), 1) if daily_data else 0
+    # Summary text
+    total_miles = sum(d["miles"] for d in daily_data.values())
+    workout_days = len(daily_data)
+    avg_minutes = round(total_minutes / workout_days, 1) if workout_days > 0 else 0
+
+    summary_text = f"You worked out on {workout_days} days and covered {total_miles:.1f} miles in {YEAR} (avg {avg_minutes} min/day) 💪"
+
+    daily_json = json.dumps(daily_data, ensure_ascii=False)
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -164,8 +197,15 @@ if __name__ == "__main__":
     }}
     .header h1 {{
       font-size: 2.7rem;
-      color: #22c55e;
+      color: #FC4C02;
       margin: 0 0 10px 0;
+    }}
+    .summary-top {{
+      text-align: center;
+      font-size: 1.35rem;
+      color: #86efac;
+      margin-bottom: 40px;
+      font-weight: 500;
     }}
     .subtitle {{
       color: #94a3b8;
@@ -216,21 +256,21 @@ if __name__ == "__main__":
       align-items: center;
       justify-content: center;
       border-radius: 12px;
-      background: #334155;
       padding: 8px 4px;
       transition: all 0.2s;
     }}
     .day:hover {{
       transform: scale(1.05);
-      box-shadow: 0 10px 20px rgba(74, 222, 128, 0.3);
+      box-shadow: 0 10px 20px rgba(252, 76, 2, 0.5);
     }}
     .day.rest {{
       background: #1e2937;
       color: #64748b;
     }}
     .day.workout {{
-      background: #14532d;
-      border: 2px solid #4ade80;
+      background: #E85C00;
+      color: #111827;
+      border: 2px solid #FF8A3D;
     }}
     .day-top {{
       display: flex;
@@ -244,14 +284,15 @@ if __name__ == "__main__":
       font-size: 0.84rem;
       line-height: 1.25;
       text-align: center;
+      color: #111827;
     }}
     .day-details small {{
-      color: #a1a1aa;
+      color: #1f2937;
       font-size: 0.81rem;
     }}
-    .summary {{
+    .summary-bottom {{
       text-align: center;
-      margin: 55px 0 25px 0;
+      margin: 60px 0 30px 0;
       font-size: 1.7rem;
       color: #86efac;
     }}
@@ -265,23 +306,21 @@ if __name__ == "__main__":
 </head>
 <body>
   <div class="header">
-    <h1>🏆 Your {YEAR} Strava Year in Motion</h1>
+    <h1>🏆 Your {YEAR} Strava Year in Motion{streak_text}</h1>
     <p class="subtitle">Every workout • Miles • Emoji • Location</p>
+    <div class="summary-top">
+      {summary_text}
+    </div>
   </div>
 
   <div id="calendar" class="calendar-container"></div>
 
-  <div class="summary" id="summary"></div>
+  <div class="summary-bottom">
+    {summary_text}
+  </div>
 
   <script>
     const dailyData = {daily_json};
-
-    let totalMiles = 0;
-    let workoutDays = Object.keys(dailyData).length;
-    Object.values(dailyData).forEach(d => {{ totalMiles += d.miles || 0; }});
-
-    document.getElementById("summary").innerHTML = 
-      `You worked out on <strong>${{workoutDays}}</strong> days and covered <strong>${{totalMiles.toFixed(1)}}</strong> miles in {YEAR} (avg ${{ {avg_minutes} }} min/day) 💪`;
 
     const months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
     const container = document.getElementById("calendar");
@@ -338,6 +377,6 @@ if __name__ == "__main__":
     with open(HTML_FILENAME, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    print(f"\n🎉 Final calendar created: {HTML_FILENAME}")
-    print(f"   Config loaded from: {CONFIG_FILE}")
-    print("   Open the HTML file to view your beautiful Strava year calendar!")
+    print(f"\n🎉 Calendar updated!")
+    print(f"   Current streak: {current_streak} days")
+    print(f"   Open {HTML_FILENAME} in your browser")
