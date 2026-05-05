@@ -2,13 +2,14 @@
 import requests
 import json
 import time
-from datetime import datetime, timedelta, timezone   # ← Fixed: added timezone
+import sys
+import random
+from datetime import datetime, timedelta, timezone
 import os
 
 # ========================= CONFIGURATION =========================
 CONFIG_FILE = "config.json"
 
-# Default config if file doesn't exist
 DEFAULT_CONFIG = {
     "CLIENT_ID": "",
     "CLIENT_SECRET": "",
@@ -16,12 +17,12 @@ DEFAULT_CONFIG = {
     "YEAR": 2026
 }
 
-# Load or create config
+# Load config
 if not os.path.exists(CONFIG_FILE):
-    print(f"⚠️  {CONFIG_FILE} not found. Creating blank config file...")
+    print(f"⚠️  {CONFIG_FILE} not found. Creating blank config...")
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(DEFAULT_CONFIG, f, indent=4)
-    print(f"✅ Created {CONFIG_FILE}. Please fill in your Strava credentials and run again.")
+    print(f"✅ Created {CONFIG_FILE}. Fill it and run again.")
     exit()
 
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -30,14 +31,19 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 CLIENT_ID = config.get("CLIENT_ID", "")
 CLIENT_SECRET = config.get("CLIENT_SECRET", "")
 REFRESH_TOKEN = config.get("REFRESH_TOKEN", "")
-YEAR = config.get("YEAR", 2026)
+CONFIG_YEAR = config.get("YEAR", 2026)
 
-if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-    print("❌ Missing credentials in config.json. Please fill in CLIENT_ID, CLIENT_SECRET, and REFRESH_TOKEN.")
-    exit()
-# ================================================================
+# Use current year by default, allow config override
+CURRENT_YEAR = datetime.now().year
+YEAR = CONFIG_YEAR if CONFIG_YEAR != 2026 else CURRENT_YEAR   # fallback smart
 
+# Database per year
+DB_FILENAME = f"{YEAR}_Strava_Database.json"
 HTML_FILENAME = f"strava_{YEAR}_calendar.html"
+
+# Command line flag
+FORCE_FULL_UPDATE = "--update" in sys.argv or "-u" in sys.argv
+# ================================================================
 
 EMOJI_MAP = {
     "Run": "🏃‍♂️", "Ride": "🚴", "VirtualRide": "🚴", "Swim": "🏊",
@@ -58,93 +64,135 @@ def refresh_access_token():
         "client_secret": CLIENT_SECRET,
         "grant_type": "refresh_token",
         "refresh_token": REFRESH_TOKEN
-    })
+    }, timeout=20)
+    
     if response.status_code != 200:
         print(f"❌ Token refresh failed: {response.status_code}")
         print(response.text)
         raise SystemExit("Token refresh failed.")
+    
     print("✅ Access token refreshed")
     return response.json()["access_token"]
 
-def get_all_activities(access_token):
+
+def get_with_retry(url, headers, params, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            
+            if response.status_code == 429:
+                wait = 60 + random.randint(0, 30)
+                print(f"⏳ Rate limit — waiting {wait}s...")
+                time.sleep(wait)
+                continue
+                
+            response.raise_for_status()
+            return response
+            
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            print(f"⚠️ Timeout (attempt {attempt+1}/{max_retries}) — retrying in {wait:.1f}s")
+            time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ HTTP Error: {e}")
+            raise
+    raise SystemExit("Failed after multiple retries")
+
+
+def load_database():
+    if os.path.exists(DB_FILENAME):
+        with open(DB_FILENAME, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_database(db):
+    with open(DB_FILENAME, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+    print(f"💾 Database saved: {DB_FILENAME} ({len(db)} activities)")
+
+
+def get_activities(access_token, since_timestamp=None):
     activities = []
     page = 1
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    # Fixed: timezone is now properly imported
-    after_ts = int(datetime(YEAR, 1, 1, tzinfo=timezone.utc).timestamp())
-    before_ts = int(datetime(YEAR + 1, 1, 1, tzinfo=timezone.utc).timestamp())
 
-    print(f"📡 Fetching activities for {YEAR}...")
-    while True:
-        params = {"after": after_ts, "before": before_ts, "per_page": 200, "page": page}
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        
-        if response.status_code == 429:
-            print("⏳ Rate limit hit — waiting 60s...")
-            time.sleep(60)
-            continue
-            
-        response.raise_for_status()
-        batch = response.json()
-        if not batch:
-            break
-        activities.extend(batch)
-        print(f"   Page {page}: +{len(batch)} activities (total: {len(activities)})")
-        time.sleep(0.7)
-        page += 1
+    year_start = int(datetime(YEAR, 1, 1, tzinfo=timezone.utc).timestamp())
+    year_end = int(datetime(YEAR + 1, 1, 1, tzinfo=timezone.utc).timestamp())
     
-    print(f"✅ Loaded {len(activities)} activities")
+    after_ts = max(since_timestamp or 0, year_start)
+
+    print(f"📡 Fetching {'ALL' if FORCE_FULL_UPDATE else 'new'} activities for {YEAR}...")
+
+    while True:
+        params = {"after": after_ts, "before": year_end, "per_page": 200, "page": page}
+        
+        print(f"   Page {page}...", end=" ")
+        response = get_with_retry(url, headers, params)
+        batch = response.json()
+
+        if not batch:
+            print("done.")
+            break
+
+        activities.extend(batch)
+        print(f"+{len(batch)} (total: {len(activities)})")
+        
+        time.sleep(1.1)
+        page += 1
+
+    print(f"✅ Fetched {len(activities)} activities")
     return activities
 
-def calculate_current_streak(daily_data):
-    """Calculate current consecutive workout days"""
-    if not daily_data:
-        return 0
-    
-    workout_dates = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in daily_data.keys()])
-    
-    if not workout_dates:
-        return 0
-    
-    today = datetime.now().date()
-    streak = 0
-    current_date = today
-    
-    while True:
-        if current_date in workout_dates:
-            streak += 1
-            current_date -= timedelta(days=1)
-        else:
-            break
-    
-    return streak
 
 # ======================== MAIN ========================
 if __name__ == "__main__":
-    access_token = refresh_access_token()
-    activities = get_all_activities(access_token)
+    print(f"🚀 Strava {YEAR} Calendar Generator")
+    if FORCE_FULL_UPDATE:
+        print("🔄 --update flag detected → Full database refresh")
 
+    access_token = refresh_access_token()
+
+    db = {} if FORCE_FULL_UPDATE else load_database()
+
+    # Get the newest timestamp in our database
+    last_ts = 0
+    if db and not FORCE_FULL_UPDATE:
+        last_ts = max((int(datetime.fromisoformat(a["start_date"].replace("Z", "+00:00")).timestamp()) 
+                      for a in db.values()), default=0)
+
+    new_activities = get_activities(access_token, last_ts if not FORCE_FULL_UPDATE else None)
+
+    # Merge new activities into database (use activity ID as key)
+    for act in new_activities:
+        db[act["id"]] = act
+
+    if new_activities or FORCE_FULL_UPDATE:
+        save_database(db)
+    else:
+        print("✅ No new activities found.")
+
+    # ===================== BUILD DAILY DATA =====================
     daily_data = {}
     total_minutes = 0
 
-    for act in activities:
+    for act in db.values():
         date_str = act.get("start_date_local", "")[:10]
-        if not date_str: 
+        if not date_str:
             continue
-            
+
         miles = round(act.get("distance", 0) / 1609.34, 2)
         moving_time_min = round(act.get("moving_time", 0) / 60, 1)
         act_type = act.get("sport_type") or act.get("type", "Workout")
         state = act.get("location_state") or "??"
-        
+
         if state in ("??", None, "", "null"):
             if "Los_Angeles" in act.get("timezone", "") or "Pacific" in act.get("timezone", ""):
                 state = "CA"
-        
+
         emoji = get_emoji(act_type)
-        
+
         if date_str not in daily_data:
             daily_data[date_str] = {
                 "emoji": emoji,
@@ -162,19 +210,33 @@ if __name__ == "__main__":
 
         total_minutes += moving_time_min
 
-    print(f"📊 Found {len(daily_data)} workout days")
+    print(f"📊 Found {len(daily_data)} workout days in database")
 
-    # Calculate current streak
+    # Current streak
+    def calculate_current_streak(daily_data):
+        if not daily_data:
+            return 0
+        workout_dates = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in daily_data.keys()])
+        today = datetime.now().date()
+        streak = 0
+        current = today
+        while current in workout_dates:
+            streak += 1
+            current -= timedelta(days=1)
+        return streak
+
     current_streak = calculate_current_streak(daily_data)
     streak_text = f" | 🔥 {current_streak} day streak" if current_streak > 1 else ""
 
-    # Summary text
     total_miles = sum(d["miles"] for d in daily_data.values())
     workout_days = len(daily_data)
     avg_minutes = round(total_minutes / workout_days, 1) if workout_days > 0 else 0
 
     summary_text = f"You worked out on {workout_days} days and covered {total_miles:.1f} miles in {YEAR} (avg {avg_minutes} min/day) 💪"
 
+    daily_json = json.dumps(daily_data, ensure_ascii=False)
+
+        # ===================== HTML GENERATION =====================
     daily_json = json.dumps(daily_data, ensure_ascii=False)
 
     html_content = f"""<!DOCTYPE html>
@@ -377,6 +439,12 @@ if __name__ == "__main__":
     with open(HTML_FILENAME, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    print(f"\n🎉 Calendar updated!")
+    print(f"\n🎉 Success! {YEAR} calendar updated")
     print(f"   Current streak: {current_streak} days")
-    print(f"   Open {HTML_FILENAME} in your browser")
+    print(f"   Database: {DB_FILENAME} ({len(db)} activities)")
+    print(f"   Open → {HTML_FILENAME}")
+
+    print(f"\n🎉 Success! {YEAR} calendar updated")
+    print(f"   Current streak: {current_streak} days")
+    print(f"   Database: {DB_FILENAME} ({len(db)} activities)")
+    print(f"   Open → {HTML_FILENAME}")
